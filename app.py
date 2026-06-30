@@ -289,6 +289,76 @@ def update_comm():
         link["latency"] = max(1, link["latency"] + random.randint(-2, 2))
         link["packet_loss"] = max(0, link["packet_loss"] + random.uniform(-0.1, 0.1))
 
+def init_flight_state():
+    return {
+        "status": "idle",          # idle, flying, paused, landing, emergency
+        "mode": "AUTO",            # AUTO, MANUAL, LOITER
+        "path_index": 0,
+        "path": [],
+        "progress": 0.0,
+        "flight_time": 0,
+        "distance_flown": 0,
+        "start_time": None,
+    }
+
+def update_flight_position(state, mavlink, speed=5.0):
+    """根据航线更新飞行器位置，speed单位m/s"""
+    if not state["path"] or state["path_index"] >= len(state["path"]) - 1:
+        if state["status"] == "flying":
+            state["status"] = "idle"
+        return
+    
+    p1 = state["path"][state["path_index"]]
+    p2 = state["path"][state["path_index"] + 1]
+    
+    seg_dist = haversine_distance(p1[0], p1[1], p2[0], p2[1])
+    if seg_dist < 1:
+        state["path_index"] += 1
+        return
+    
+    # 每帧前进 speed 米（约0.5秒一帧 -> speed*0.5）
+    step = speed * 0.5
+    state["progress"] += step / seg_dist
+    state["distance_flown"] += step
+    
+    if state["progress"] >= 1.0:
+        state["progress"] = 0.0
+        state["path_index"] += 1
+        if state["path_index"] >= len(state["path"]) - 1:
+            state["status"] = "idle"
+        return
+    
+    t = state["progress"]
+    lng = p1[0] + t * (p2[0] - p1[0])
+    lat = p1[1] + t * (p2[1] - p1[1])
+    
+    mavlink["lon"] = lng
+    mavlink["lat"] = lat
+    
+    # 航向
+    heading = math.degrees(math.atan2(p2[1]-p1[1], p2[0]-p1[0]))
+    if heading < 0: heading += 360
+    mavlink["heading"] = int(heading)
+    mavlink["yaw"] = math.radians(heading)
+    
+    # 姿态微调（模拟飞行抖动）
+    mavlink["roll"] = random.uniform(-0.05, 0.05)
+    mavlink["pitch"] = random.uniform(-0.05, 0.05)
+
+def set_flight_altitude(mavlink, target_alt, rate=2.0):
+    """调整高度，rate爬升率m/s"""
+    diff = target_alt - mavlink["alt"]
+    step = rate * 0.5
+    if abs(diff) <= step:
+        mavlink["alt"] = target_alt
+        mavlink["climb_rate"] = 0
+    elif diff > 0:
+        mavlink["alt"] += step
+        mavlink["climb_rate"] = rate
+    else:
+        mavlink["alt"] -= step
+        mavlink["climb_rate"] = -rate
+
 # ==================== Session State 初始化 ====================
 if 'obstacles' not in st.session_state:
     st.session_state.obstacles = load_obstacles()
@@ -307,6 +377,12 @@ if 'safety_radius' not in st.session_state:
 
 if 'mavlink' not in st.session_state:
     st.session_state.mavlink = init_mavlink_state()
+
+if 'flight' not in st.session_state:
+    st.session_state.flight = init_flight_state()
+
+if 'flight_speed' not in st.session_state:
+    st.session_state.flight_speed = 8.0
 
 if 'map_center' not in st.session_state:
     st.session_state.map_center = [32.234097, 118.749413]
@@ -637,11 +713,112 @@ elif page.startswith("🔄"):
 elif page.startswith("📊"):
     st.markdown('<div class="main-header">📊 飞行监控</div>', unsafe_allow_html=True)
     
-    # 更新数据
-    for _ in range(3):
-        update_mavlink(st.session_state.mavlink)
     m = st.session_state.mavlink
+    f = st.session_state.flight
     
+    # 状态标签
+    status_map = {
+        "idle": ("待飞", "gray"),
+        "flying": ("飞行中", "green"),
+        "paused": ("已暂停", "orange"),
+        "landing": ("降落中", "blue"),
+        "emergency": ("紧急！", "red"),
+    }
+    status_text, status_color = status_map.get(f["status"], ("未知", "gray"))
+    st.markdown(f'<div style="text-align:center;margin-bottom:10px;">'
+                f'<span style="background:{status_color};color:white;padding:6px 20px;'
+                f'border-radius:20px;font-weight:bold;">● {status_text}</span> '
+                f'<span style="margin-left:20px;">模式: <b>{f["mode"]}</b></span> '
+                f'<span style="margin-left:20px;">航段: <b>{f["path_index"]+1}/{max(len(f["path"])-1,1)}</b></span>'
+                f'</div>', unsafe_allow_html=True)
+    
+    # 控制按钮区
+    c0, c1, c2, c3, c4, c5, c6 = st.columns([1,1,1,1,1,1,2])
+    with c0:
+        if st.button("▶️ 起飞", use_container_width=True):
+            if f["status"] == "idle":
+                # 从A点起飞，使用最优路径或直飞
+                if 'planned_paths' in st.session_state and st.session_state.planned_paths.get("optimal"):
+                    f["path"] = st.session_state.planned_paths["optimal"]
+                else:
+                    f["path"] = [st.session_state.point_a, st.session_state.point_b]
+                f["path_index"] = 0
+                f["progress"] = 0.0
+                f["status"] = "flying"
+                f["mode"] = "AUTO"
+                f["start_time"] = time.time()
+                f["distance_flown"] = 0
+                m["lon"] = f["path"][0][0]
+                m["lat"] = f["path"][0][1]
+                m["alt"] = st.session_state.flight_height
+                st.rerun()
+    with c1:
+        if st.button("⏸️ 暂停", use_container_width=True):
+            if f["status"] == "flying":
+                f["status"] = "paused"
+                st.rerun()
+    with c2:
+        if st.button("▶️ 继续", use_container_width=True):
+            if f["status"] == "paused":
+                f["status"] = "flying"
+                st.rerun()
+    with c3:
+        if st.button("⬇️ 降落", use_container_width=True):
+            if f["status"] in ("flying", "paused"):
+                f["status"] = "landing"
+                st.rerun()
+    with c4:
+        if st.button("🚨 紧急", use_container_width=True):
+            f["status"] = "emergency"
+            f["mode"] = "RTL"
+            st.rerun()
+    with c5:
+        if st.button("🔄 复位", use_container_width=True):
+            f["status"] = "idle"
+            f["mode"] = "AUTO"
+            f["path_index"] = 0
+            f["progress"] = 0.0
+            f["distance_flown"] = 0
+            f["path"] = []
+            m["lon"] = st.session_state.point_a[0]
+            m["lat"] = st.session_state.point_a[1]
+            m["alt"] = st.session_state.flight_height
+            m["groundspeed"] = 0
+            m["airspeed"] = 0
+            m["heading"] = 0
+            m["throttle"] = 0
+            m["climb_rate"] = 0
+            st.rerun()
+    with c6:
+        st.session_state.flight_speed = st.slider("飞行速度 (m/s)", 1.0, 20.0, st.session_state.flight_speed, 0.5)
+    
+    # 更新飞行状态
+    if f["status"] == "flying":
+        update_flight_position(f, m, speed=st.session_state.flight_speed)
+        m["groundspeed"] = st.session_state.flight_speed + random.uniform(-0.3, 0.3)
+        m["airspeed"] = st.session_state.flight_speed + random.uniform(-0.5, 0.5)
+        m["throttle"] = random.randint(50, 70)
+        m["battery_remaining"] = max(5, m["battery_remaining"] - 0.02)
+        f["flight_time"] = int(time.time() - f["start_time"]) if f["start_time"] else 0
+    elif f["status"] == "paused":
+        m["groundspeed"] = 0
+        m["airspeed"] = 0
+        m["throttle"] = 30
+        m["climb_rate"] = 0
+    elif f["status"] == "landing":
+        set_flight_altitude(m, 5.0, rate=1.5)
+        if m["alt"] <= 5.1:
+            f["status"] = "idle"
+            m["groundspeed"] = 0
+            m["airspeed"] = 0
+            m["throttle"] = 0
+    elif f["status"] == "emergency":
+        m["groundspeed"] = 0
+        m["airspeed"] = 0
+        m["throttle"] = 0
+        set_flight_altitude(m, 2.0, rate=3.0)
+    
+    # 飞行参数显示
     c1, c2, c3, c4 = st.columns(4)
     with c1:
         st.metric("地速", f"{m['groundspeed']:.1f} m/s")
@@ -664,6 +841,8 @@ elif page.startswith("📊"):
         st.write(f"**纬度**: {m['lat']:.6f}°")
         st.write(f"**经度**: {m['lon']:.6f}°")
         st.write(f"**海拔**: {m['alt']:.1f} m")
+        st.write(f"**飞行时间**: {f['flight_time']} 秒")
+        st.write(f"**已飞距离**: {f['distance_flown']:.1f} m")
     with c2:
         st.markdown("### 🔄 姿态信息")
         st.write(f"**横滚**: {math.degrees(m['roll']):.1f}°")
@@ -684,12 +863,30 @@ elif page.startswith("📊"):
         tiles="https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}",
         attr="Esri", name="卫星地图").add_to(mmap)
     folium.LayerControl().add_to(mmap)
-    folium.Marker(location=[m['lat'], m['lon']],
-        popup=f"高度: {m['alt']:.1f}m<br>航向: {m['heading']}°",
-        icon=folium.Icon(color="blue", icon="plane", prefix="fa")).add_to(mmap)
-    st_folium(mmap, width=800, height=400, key="map_flight")
     
-    if st.button("🔄 刷新"):
+    # 绘制航线
+    if f["path"]:
+        folium.PolyLine(locations=[[p[1],p[0]] for p in f["path"]],
+            color="blue", weight=2, opacity=0.5, dash_array="5,5").add_to(mmap)
+        # 起点终点
+        folium.Marker([f["path"][0][1], f["path"][0][0]],
+            popup="起点", icon=folium.Icon(color="green", icon="play", prefix="fa")).add_to(mmap)
+        folium.Marker([f["path"][-1][1], f["path"][-1][0]],
+            popup="终点", icon=folium.Icon(color="red", icon="stop", prefix="fa")).add_to(mmap)
+    
+    # 无人机位置
+    folium.Marker(location=[m['lat'], m['lon']],
+        popup=f"高度: {m['alt']:.1f}m<br>航向: {m['heading']}°<br>速度: {m['groundspeed']:.1f}m/s",
+        icon=folium.Icon(color="blue", icon="plane", prefix="fa")).add_to(mmap)
+    
+    st_folium(mmap, width=800, height=450, key="map_flight")
+    
+    # 自动刷新（飞行中每0.8秒刷新一次）
+    if f["status"] in ("flying", "landing", "emergency"):
+        time.sleep(0.8)
+        st.rerun()
+    
+    if st.button("🔄 手动刷新"):
         st.rerun()
 
 # ==================== 页面6：通信链路 ====================
